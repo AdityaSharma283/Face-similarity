@@ -1,8 +1,8 @@
-streamlit
-opencv-python
-numpy
-Pillow
-deepface
-tensorflow
-tf-keras
-protobuf
+streamlit>=1.28.0
+opencv-python>=4.8.0
+numpy>=1.24.0
+Pillow>=10.0.0
+deepface>=0.0.79
+tensorflow>=2.13.0
+tf-keras>=2.13.0
+protobuf>=3.19.0
