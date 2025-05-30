@@ -1,388 +1,303 @@
 import streamlit as st
 import cv2
-import face_recognition
 import numpy as np
-import os
-from PIL import Image
-import io
-from datetime import datetime
+from PIL import Image, ImageEnhance
+from deepface import DeepFace
 import tempfile
+import os
+import logging
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
+import time
 
-class FaceSimilarityApp:
-    def __init__(self):
-        self.setup_page_config()
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Streamlit page setup
+st.set_page_config(page_title="Face Similarity Detector", layout="wide")
+
+# Optimized preprocessing
+def optimize_image(img):
+    """Image optimization for better face detection"""
+    try:
+        # Convert to numpy array
+        img_array = np.array(img)
         
-    def setup_page_config(self):
-        """Configure Streamlit page"""
-        st.set_page_config(
-            page_title="Face Similarity Detector",
-            page_icon="👥",
-            layout="wide",
-            initial_sidebar_state="expanded"
-        )
+        # Face detection and cropping
+        img_bgr = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
+        face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
         
-    def load_and_encode_face(self, image_file):
-        """Load an image and encode the face"""
+        # Face detection with relaxed parameters
+        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.2, minNeighbors=3, minSize=(50, 50))
+        
+        if len(faces) > 0:
+            # Get the largest face
+            face = max(faces, key=lambda x: x[2] * x[3])
+            x, y, w, h = face
+            
+            # Small margin for context
+            margin = int(0.1 * min(w, h))
+            x = max(0, x - margin)
+            y = max(0, y - margin)
+            w = min(img_bgr.shape[1] - x, w + 2 * margin)
+            h = min(img_bgr.shape[0] - y, h + 2 * margin)
+            
+            # Crop to face
+            img_bgr = img_bgr[y:y+h, x:x+w]
+            
+            # Contrast enhancement only if needed
+            if img_bgr.mean() < 100:
+                img_bgr = cv2.convertScaleAbs(img_bgr, alpha=1.2, beta=20)
+        
+        # Ensure minimum size for good detection
+        height, width = img_bgr.shape[:2]
+        if width < 160 or height < 160:
+            scale = max(160 / width, 160 / height)
+            new_width = int(width * scale)
+            new_height = int(height * scale)
+            img_bgr = cv2.resize(img_bgr, (new_width, new_height), interpolation=cv2.INTER_LINEAR)
+        
+        # Convert back to RGB
+        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        return Image.fromarray(img_rgb)
+        
+    except Exception as e:
+        logger.warning(f"Optimization failed, using original: {e}")
+        return img
+
+# Similarity calculation with timeout
+def calculate_similarity(img1, img2):
+    """Similarity calculation using optimized model with timeout"""
+    
+    def run_analysis():
         try:
-            # Handle different types of image inputs
-            if hasattr(image_file, 'read'):
-                # This is an uploaded file from Streamlit
-                image_bytes = image_file.read()
-                # Create a fresh BytesIO object
-                image_io = io.BytesIO(image_bytes)
-                image = Image.open(image_io)
-                # Convert PIL image to RGB if it isn't already
-                if image.mode != 'RGB':
-                    image = image.convert('RGB')
-                image_np = np.array(image)
-            elif isinstance(image_file, np.ndarray):
-                # This is already a numpy array (e.g., from camera)
-                image_np = image_file
-                # Ensure it's RGB format
-                if len(image_np.shape) == 3 and image_np.shape[2] == 3:
-                    # Assume it's RGB already for numpy arrays
-                    pass
-            elif isinstance(image_file, Image.Image):
-                # This is a PIL Image
-                if image_file.mode != 'RGB':
-                    image_file = image_file.convert('RGB')
-                image_np = np.array(image_file)
-            else:
-                return None, f"Unsupported image type: {type(image_file)}"
+            # Image optimization
+            img1_opt = optimize_image(img1)
+            img2_opt = optimize_image(img2)
             
-            # Find face locations
-            face_locations = face_recognition.face_locations(image_np)
+            # Create temporary files
+            temp_dir = tempfile.gettempdir()
             
-            if len(face_locations) == 0:
-                return None, "No face found in the image"
+            with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False, dir=temp_dir) as tmp1, \
+                 tempfile.NamedTemporaryFile(suffix=".jpg", delete=False, dir=temp_dir) as tmp2:
                 
-            if len(face_locations) > 1:
-                st.warning(f"Multiple faces found. Using the first detected face.")
-            
-            # Get face encoding
-            face_encodings = face_recognition.face_encodings(image_np, face_locations)
-            
-            if len(face_encodings) > 0:
-                return face_encodings[0], f"Face detected successfully! ({len(face_locations)} face(s) found)"
-            else:
-                return None, "Could not encode the face"
+                # Save with optimized quality
+                img1_opt.save(tmp1.name, format='JPEG', quality=85, optimize=True)
+                img2_opt.save(tmp2.name, format='JPEG', quality=85, optimize=True)
                 
-        except Exception as e:
-            return None, f"Error processing image: {str(e)}"
-    
-    def calculate_similarity(self, encoding1, encoding2):
-        """Calculate similarity percentage between two face encodings"""
-        if encoding1 is None or encoding2 is None:
-            return 0
-            
-        # Calculate face distance (lower distance = more similar)
-        face_distance = face_recognition.face_distance([encoding1], encoding2)[0]
-        
-        # Convert distance to similarity percentage
-        similarity = max(0, (1 - face_distance) * 100)
-        
-        return similarity
-    
-    def get_similarity_status(self, similarity):
-        """Get status message based on similarity percentage"""
-        if similarity > 80:
-            return "🟢 Very High Similarity - Likely the same person", "success"
-        elif similarity > 60:
-            return "🟡 High Similarity - Probably the same person", "warning"
-        elif similarity > 40:
-            return "🟠 Moderate Similarity - Could be the same person", "info"
-        elif similarity > 20:
-            return "🔴 Low Similarity - Probably different people", "error"
-        else:
-            return "⚫ Very Low Similarity - Likely different people", "error"
-    
-    def capture_camera_frame(self):
-        """Capture image from camera with manual control"""
-        try:
-            camera = cv2.VideoCapture(0)
-            
-            if not camera.isOpened():
-                return None, "Could not access camera"
-            
-            # Set camera properties for better quality
-            camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-            camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-            
-            # Allow camera to warm up
-            for _ in range(5):
-                ret, frame = camera.read()
-                if not ret:
-                    camera.release()
-                    return None, "Could not capture image"
-            
-            # Get the final frame
-            ret, frame = camera.read()
-            camera.release()
-            
-            if ret:
-                # Convert BGR to RGB for display
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                return frame_rgb, "Image captured successfully"
-            else:
-                return None, "Could not capture image"
+                tmp1.close()
+                tmp2.close()
                 
-        except Exception as e:
-            return None, f"Camera error: {str(e)}"
-    
-    def display_comparison_result(self, similarity, image1, image2, status_msg1, status_msg2):
-        """Display comparison results in a nice format"""
-        col1, col2, col3 = st.columns([1, 1, 1])
-        
-        with col1:
-            st.subheader("Image 1")
-            if image1 is not None:
-                st.image(image1, use_container_width=True)
-                st.success(status_msg1)
-            else:
-                st.error("No image provided")
-        
-        with col2:
-            st.subheader("Similarity Analysis")
-            
-            # Create a large similarity display
-            st.markdown(f"""
-            <div style="text-align: center; padding: 20px; background-color: #f0f2f6; border-radius: 10px; margin: 20px 0;">
-                <h1 style="color: #1f77b4; font-size: 3em; margin: 0;">{similarity:.1f}%</h1>
-                <p style="font-size: 1.2em; margin: 10px 0;">Face Similarity</p>
-            </div>
-            """, unsafe_allow_html=True)
-            
-            # Status message
-            status_text, status_type = self.get_similarity_status(similarity)
-            if status_type == "success":
-                st.success(status_text)
-            elif status_type == "warning":
-                st.warning(status_text)
-            elif status_type == "info":
-                st.info(status_text)
-            else:
-                st.error(status_text)
-        
-        with col3:
-            st.subheader("Image 2")
-            if image2 is not None:
-                st.image(image2, use_container_width=True)
-                st.success(status_msg2)
-            else:
-                st.error("No image provided")
-    
-    def run(self):
-        """Main application"""
-        # Header
-        st.title(" Face Similarity Detector")
-        st.markdown("Compare faces and get similarity percentage using advanced AI algorithms")
-        st.markdown("---")
-        
-        # Sidebar for mode selection
-        st.sidebar.title("🔧 Options")
-        mode = st.sidebar.selectbox(
-            "Select Mode:",
-            ["📸 Camera + Reference Image", "🖼️ Compare Two Images", "ℹ️ About"]
-        )
-        
-        if mode == "📸 Camera + Reference Image":
-            self.camera_mode()
-        elif mode == "🖼️ Compare Two Images":
-            self.image_comparison_mode()
-        else:
-            self.about_page()
-    
-    def camera_mode(self):
-        """Camera capture and comparison mode"""
-        st.header("📸 Camera Capture Mode")
-        st.markdown("Upload a reference image and capture from camera to compare")
-        
-        col1, col2 = st.columns([1, 1])
-        
-        with col1:
-            st.subheader("Step 1: Upload Reference Image")
-            reference_file = st.file_uploader(
-                "Choose reference image file",
-                type=['jpg', 'jpeg', 'png'],
-                key="reference_upload"
-            )
-            
-            if reference_file is not None:
-                # Create a copy of the image for display
-                reference_file.seek(0)
-                reference_image = Image.open(reference_file)
-                st.image(reference_image, caption="Reference Image", use_container_width=True)
-                
-                # Encode reference face
-                reference_file.seek(0)  # Reset file pointer before processing
-                ref_encoding, ref_status = self.load_and_encode_face(reference_file)
-                if ref_encoding is not None:
-                    st.success(ref_status)
-                    # Store the encoding in session state to avoid reprocessing
-                    st.session_state.ref_encoding = ref_encoding
-                    st.session_state.ref_status = ref_status
-                    st.session_state.ref_image = reference_image
-                else:
-                    st.error(ref_status)
-                    return
-        
-        with col2:
-            st.subheader("Step 2: Capture from Camera")
-            
-            if st.button("📷 Capture Photo", type="primary"):
-                with st.spinner("Accessing camera..."):
-                    captured_frame, capture_status = self.capture_camera_frame()
+                try:
+                    # Use Facenet512 for balanced performance
+                    result = DeepFace.verify(
+                        img1_path=tmp1.name, 
+                        img2_path=tmp2.name, 
+                        model_name="Facenet512",
+                        distance_metric="cosine",
+                        enforce_detection=False,
+                        silent=True
+                    )
                     
-                if captured_frame is not None:
-                    st.image(captured_frame, caption="Captured Image", use_container_width=True)
-                    st.success(capture_status)
+                    similarity = (1 - result["distance"]) * 100
+                    return similarity, result["verified"], None
                     
-                    # Store captured image in session state
-                    st.session_state.captured_image = captured_frame
-                else:
-                    st.error(capture_status)
-        
-        # Compare if both images are available
-        if ('ref_encoding' in st.session_state and 
-            'captured_image' in st.session_state):
-            st.markdown("---")
-            st.header("🔍 Comparison Results")
-            
-            if st.button(" Compare Faces", type="primary"):
-                with st.spinner("Analyzing faces..."):
-                    # Encode captured face
-                    captured_encoding, captured_status = self.load_and_encode_face(st.session_state.captured_image)
-                    
-                    if st.session_state.ref_encoding is not None and captured_encoding is not None:
-                        similarity = self.calculate_similarity(st.session_state.ref_encoding, captured_encoding)
+                finally:
+                    # Cleanup
+                    try:
+                        os.unlink(tmp1.name)
+                        os.unlink(tmp2.name)
+                    except OSError:
+                        pass
                         
-                        self.display_comparison_result(
-                            similarity,
-                            st.session_state.ref_image,
-                            Image.fromarray(st.session_state.captured_image),
-                            st.session_state.ref_status,
-                            captured_status
-                        )
-                    else:
-                        st.error("Could not process one or both images for comparison")
+        except Exception as e:
+            return 0, False, str(e)
     
-    def image_comparison_mode(self):
-        """Compare two uploaded images mode"""
-        st.header("🖼️ Image Comparison Mode")
-        st.markdown("Upload two images to compare their facial similarity")
-        
-        col1, col2 = st.columns([1, 1])
-        
-        with col1:
-            st.subheader("Image 1")
-            image1_file = st.file_uploader(
-                "Choose first image",
-                type=['jpg', 'jpeg', 'png'],
-                key="image1_upload"
-            )
-            
-            if image1_file is not None:
-                image1_file.seek(0)
-                image1 = Image.open(image1_file)
-                st.image(image1, caption="Image 1", use_container_width=True)
-        
-        with col2:
-            st.subheader("Image 2")
-            image2_file = st.file_uploader(
-                "Choose second image",
-                type=['jpg', 'jpeg', 'png'],
-                key="image2_upload"
-            )
-            
-            if image2_file is not None:
-                image2_file.seek(0)
-                image2 = Image.open(image2_file)
-                st.image(image2, caption="Image 2", use_container_width=True)
-        
-        # Compare button
-        if image1_file is not None and image2_file is not None:
-            st.markdown("---")
-            
-            if st.button(" Compare Faces", type="primary", key="compare_images"):
-                with st.spinner("Analyzing faces..."):
-                    # Reset file pointers before processing
-                    image1_file.seek(0)
-                    image2_file.seek(0)
-                    
-                    # Encode both faces
-                    encoding1, status1 = self.load_and_encode_face(image1_file)
-                    
-                    # Reset file pointer again for second processing
-                    image2_file.seek(0)
-                    encoding2, status2 = self.load_and_encode_face(image2_file)
-                    
-                    if encoding1 is not None and encoding2 is not None:
-                        similarity = self.calculate_similarity(encoding1, encoding2)
-                        
-                        st.header("🔍 Comparison Results")
-                        # Use the images already loaded for display
-                        image1_file.seek(0)
-                        image2_file.seek(0)
-                        self.display_comparison_result(
-                            similarity,
-                            Image.open(image1_file),
-                            Image.open(image2_file),
-                            status1,
-                            status2
-                        )
-                    else:
-                        st.error("Could not process one or both images:")
-                        if encoding1 is None:
-                            st.error(f"Image 1: {status1}")
-                        if encoding2 is None:
-                            st.error(f"Image 2: {status2}")
+    # Run with timeout
+    try:
+        with ThreadPoolExecutor() as executor:
+            future = executor.submit(run_analysis)
+            return future.result(timeout=15)
+    except TimeoutError:
+        return 0, False, "Analysis timed out - please try with clearer images"
+    except Exception as e:
+        return 0, False, str(e)
+
+# Similarity interpretation
+def get_similarity_status(similarity):
+    """Similarity interpretation"""
+    if similarity > 80:
+        return "Excellent Match - Same person", "success"
+    elif similarity > 70:
+        return "Very High Similarity - Likely same person", "success"
+    elif similarity > 60:
+        return "High Similarity - Probably same person", "warning"
+    elif similarity > 50:
+        return "Moderate Similarity - Could be same person", "warning"
+    elif similarity > 40:
+        return "Low-Moderate Similarity - Uncertain", "info"
+    else:
+        return "Low Similarity - Likely different people", "error"
+
+# Results display
+def display_results(similarity, img1, img2, processing_time=None):
+    """Display results clearly"""
+    col1, col2, col3 = st.columns([1, 1, 1])
     
-    def about_page(self):
-        """About page with information"""
-        st.header("ℹ️ About Face Similarity Detector")
+    with col1:
+        st.subheader("Reference Image")
+        st.image(img1, use_container_width=True)
+    
+    with col2:
+        st.subheader("Similarity Score")
+        st.markdown(f"<h1 style='text-align:center; color: #1f77b4;'>{similarity:.1f}%</h1>", unsafe_allow_html=True)
+        msg, level = get_similarity_status(similarity)
+        getattr(st, level)(msg)
         
+        if processing_time:
+            st.info(f"Processed in {processing_time:.1f} seconds")
+        
+        st.progress(min(similarity/100, 1.0))
+    
+    with col3:
+        st.subheader("Comparison Image")
+        st.image(img2, use_container_width=True)
+
+# Camera mode
+def camera_mode():
+    st.header("Upload Reference + Camera Photo")
+    
+    with st.expander("Tips for Best Results"):
         st.markdown("""
-        ###  What it does
-        This application uses advanced machine learning algorithms to compare facial features and determine similarity between faces.
-        
-        ###  How it works
-        1. **Face Detection**: Locates faces in images using HOG (Histogram of Oriented Gradients)
-        2. **Face Encoding**: Creates 128-dimensional face signatures using deep neural networks
-        3. **Similarity Calculation**: Computes Euclidean distance between encodings
-        4. **Percentage Conversion**: Converts distance to intuitive similarity percentage
-        
-        ###  Similarity Levels
-        - **80%+**: Very High Similarity - Likely the same person
-        - **60-80%**: High Similarity - Probably the same person
-        - **40-60%**: Moderate Similarity - Could be the same person
-        - **20-40%**: Low Similarity - Probably different people
-        - **0-20%**: Very Low Similarity - Likely different people
-        
-        ###  Features
-        - **Real-time camera capture**
-        - **Multiple image format support** (JPG, PNG, JPEG)
-        - **Advanced face recognition** using state-of-the-art algorithms
-        - **User-friendly interface** with visual feedback
-        - **Multiple comparison modes**
-        
-        ###  Privacy
-        - All processing happens locally on your machine
-        - No images are stored or sent to external servers
-        - Camera access is only used when explicitly requested
-        
-        ###  Tips for best results
-        - Use clear, well-lit images
-        - Ensure faces are clearly visible and not obscured
+        - Use good lighting and clear faces
         - Front-facing photos work best
-        - Avoid extreme angles or lighting conditions
+        - Avoid sunglasses or masks if possible
+        - Analysis typically takes 3-8 seconds
         """)
-        
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.subheader("Reference Image")
+        uploaded_file = st.file_uploader("Upload reference", type=["jpg", "jpeg", "png"])
+        if uploaded_file:
+            ref_img = Image.open(uploaded_file).convert("RGB")
+            st.image(ref_img, caption="Reference", use_container_width=True)
+    
+    with col2:
+        st.subheader("Camera Photo")
+        camera_photo = st.camera_input("Take photo")
+        if camera_photo:
+            camera_img = Image.open(camera_photo).convert("RGB")
+            st.image(camera_img, caption="Camera", use_container_width=True)
+    
+    # Analysis
+    if uploaded_file and camera_photo:
         st.markdown("---")
-        st.markdown("**Built with:** Python, Streamlit, OpenCV, face_recognition, dlib")
+        if st.button("Analyze Similarity", use_container_width=True, type="primary"):
+            start_time = time.time()
+            
+            with st.spinner("Analyzing faces..."):
+                similarity, verified, error = calculate_similarity(ref_img, camera_img)
+                
+            processing_time = time.time() - start_time
+            
+            if error:
+                st.error(f"Error: {error}")
+            else:
+                st.success("Analysis complete!")
+                display_results(similarity, ref_img, camera_img, processing_time)
 
+# Image comparison mode
+def image_comparison_mode():
+    st.header("Compare Two Images")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        img1_file = st.file_uploader("First Image", type=["jpg", "jpeg", "png"], key="img1")
+        if img1_file:
+            img1 = Image.open(img1_file).convert("RGB")
+            st.image(img1, caption="Image 1", use_container_width=True)
+    
+    with col2:
+        img2_file = st.file_uploader("Second Image", type=["jpg", "jpeg", "png"], key="img2")
+        if img2_file:
+            img2 = Image.open(img2_file).convert("RGB")
+            st.image(img2, caption="Image 2", use_container_width=True)
+
+    if img1_file and img2_file:
+        st.markdown("---")
+        if st.button("Compare Images", use_container_width=True, type="primary"):
+            start_time = time.time()
+            
+            with st.spinner("Comparing faces..."):
+                similarity, verified, error = calculate_similarity(img1, img2)
+                
+            processing_time = time.time() - start_time
+            
+            if error:
+                st.error(f"Error: {error}")
+            else:
+                st.success("Comparison complete!")
+                display_results(similarity, img1, img2, processing_time)
+
+# About page
+def about_page():
+    st.header("About Face Similarity Detector")
+    
+    st.markdown("""
+    This application uses advanced AI models to compare facial similarities between two images.
+    
+    ### Features
+    - **Automatic face detection** and cropping for better accuracy
+    - **Smart preprocessing** with contrast enhancement when needed
+    - **Timeout protection** prevents long processing times
+    - **Optimized processing** for best speed/accuracy balance
+    
+    ### Performance Optimization
+    - **3-8 second analysis time** with balanced accuracy
+    - **15-second timeout** limit to prevent hanging
+    - **Efficient memory management** and cleanup
+    
+    ### Technical Details
+    - **Model**: Facenet512 for balanced speed and accuracy
+    - **Distance Metric**: Cosine similarity
+    - **Image Processing**: OpenCV for face detection and enhancement
+    - **Quality Settings**: Optimized JPEG compression for best results
+    
+    ### Accuracy Features
+    - Face detection with automatic cropping
+    - Contrast adjustment for low-light images
+    - Minimum resolution requirements
+    - Robust error handling and fallbacks
+    
+    ### Usage Tips
+    - Use well-lit, front-facing photos for best results
+    - Ensure faces are clearly visible and unobstructed
+    - Higher quality images generally produce better accuracy
+    - Remove glasses, hats, or face coverings when possible
+    """)
+
+# Main app
 def main():
-    app = FaceSimilarityApp()
-    app.run()
+    st.title("Face Similarity Detector")
+    st.markdown("**AI-powered facial recognition and comparison**")
+    
+    # Sidebar for mode selection
+    st.sidebar.markdown("### Select Mode")
+    mode = st.sidebar.radio(
+        "Choose comparison method:",
+        ["Camera + Upload", "Compare Two Images", "About"],
+        index=0
+    )
+    
+    if mode == "Camera + Upload":
+        camera_mode()
+    elif mode == "Compare Two Images":
+        image_comparison_mode()
+    else:
+        about_page()
 
 if __name__ == "__main__":
     main()

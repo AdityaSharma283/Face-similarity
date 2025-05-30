@@ -1,6 +1,8 @@
 streamlit
 opencv-python
-face-recognition==1.3.0
 numpy
-dlib==19.24.0
 Pillow
+deepface
+tensorflow
+tf-keras
+protobuf
