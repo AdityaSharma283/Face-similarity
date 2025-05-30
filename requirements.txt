@@ -1,7 +1,10 @@
-deepface==0.0.93
-numpy==2.2.6
-opencv_python==4.10.0.84
-opencv_python==4.11.0.86
-Pillow==11.2.1
-streamlit==1.44.1
-streamlit==1.45.1
+streamlit>=1.28.0
+opencv-python-headless==4.8.1.78
+numpy==1.24.3
+Pillow==10.0.1
+deepface==0.0.79
+tensorflow==2.13.0
+protobuf==3.20.3
+gdown==4.7.1
+requests==2.31.0
+tqdm==4.66.1
